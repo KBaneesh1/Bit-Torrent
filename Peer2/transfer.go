@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"strings"
@@ -11,7 +12,7 @@ import (
 )
 
 const (
-	listenPort = ":8081"        // Port to listen on
+	listenPort = ":8081"          // Port to listen on
 	remoteAddr = "localhost:8080" // Address of the other peer
 )
 
@@ -31,6 +32,11 @@ func main() {
 		defer wg.Done()
 		startClient()
 	}()
+
+	peerAddress := "localhost:8080" // Example address of receiving peer
+	message := "Hello from Peer 2!" // Message to send
+
+	sendMessageToPeer(peerAddress, message)
 
 	wg.Wait()
 }
@@ -131,4 +137,15 @@ func startClient() {
 		receivedFile.Close()
 		conn.Close()
 	}
+}
+
+func sendMessageToPeer(address string, message string) {
+	conn, err := net.Dial("tcp", address) // Connect to the receiving peer
+	if err != nil {
+		log.Fatalf("Error connecting to peer at %s: %v", address, err)
+	}
+	defer conn.Close()
+
+	fmt.Fprintf(conn, message+"\n") // Send message
+	fmt.Printf("Sent message: %s\n", message)
 }
