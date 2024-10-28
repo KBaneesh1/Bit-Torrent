@@ -2,14 +2,16 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"runtime"
+	"sort"
 	"time"
-	"io"
+
 	// "errors"
-	"sync"
 	"encoding/json"
+	"sync"
 )
 
 
@@ -28,7 +30,11 @@ var (
 	allPeers      = make(map[int]*Peer)
 	peerLastUpdate = make(map[int]time.Time) // Stores last update timestamp for each peer
 	fileOwners    = make(map[string][]*Peer)
-	mu            sync.Mutex // To handle concurrent map access
+)
+var (
+    peersMu       sync.RWMutex
+    updatesMu     sync.RWMutex
+    fileOwnersMu  sync.RWMutex
 )
 func parseRegisterRequest(r *http.Request) (*Peer, error) {
 	var data Peer
@@ -69,9 +75,15 @@ func registerPeer(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(response)
 		return
 	}
-	
+	peersMu.Lock()
+	defer  peersMu.Unlock()
+
 	allPeers[peerIP] = data
+
+	updatesMu.Lock()
+	defer  updatesMu.Unlock()
 	peerLastUpdate[peerIP] = time.Now()
+	
 	// Send a response back to the client
 	w.WriteHeader(http.StatusOK)
 	w.Header().Set("Content-Type", "application/json")
@@ -93,24 +105,29 @@ func updatePeerStatus(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid JSON", http.StatusBadRequest)
 		return
 	}
-
+	peersMu.RLock()
 	peer, exists := allPeers[data.Peer.IP]
+	peersMu.RUnlock()
 	if !exists {
 		http.Error(w, "Peer not registered", http.StatusNotFound)
 		return
 	}
-
+	updatesMu.Lock()
 	peerLastUpdate[data.Peer.IP] = time.Now()
+	updatesMu.Unlock()
 	// Update peer stats
+	peersMu.Lock()
 	allPeers[peer.IP] = &data.Peer
+	peersMu.Unlock()
 	// Update file ownership
+	fileOwnersMu.Lock()
 	for _, file := range data.Files {
 		if _, exists := fileOwners[file]; !exists {
 			fileOwners[file] = make([]*Peer, 0)
 		}
 		fileOwners[file] = append(fileOwners[file], peer)
 	}
-
+	fileOwnersMu.Unlock()
 	// Send response back to the client
 	w.WriteHeader(http.StatusOK)
 	w.Header().Set("Content-Type", "application/json")
@@ -123,7 +140,8 @@ func startPeerTimeoutChecker() {
 	defer ticker.Stop()
 
 	for range ticker.C {
-		mu.Lock()
+		peersMu.Lock()
+		updatesMu.Lock()
 		for ip, lastUpdate := range peerLastUpdate {
 			if time.Since(lastUpdate) > 30*time.Minute {
 				fmt.Printf("Removing inactive peer with IP: %d\n", ip)
@@ -131,19 +149,47 @@ func startPeerTimeoutChecker() {
 				delete(peerLastUpdate, ip)
 			}
 		}
-		mu.Unlock()
+		peersMu.Unlock()
+		updatesMu.Unlock()
 	}
 }
 
-func getPeers (w http.ResponseWriter, r *http.Request) {
+func getPeers (w http.ResponseWriter, r *http.Request)  {
 	// Get all peers
 	if r.Method != http.MethodGet {
 		http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
-		return
+		return 
 	}
 	// Send response back to the client
 	//TODO based on the meesage sent from Peer
+	fileName := r.URL.Query().Get("file")
+	if  fileName == "" {
+		http.Error(w, "Missing file parameter", http.StatusBadRequest)
+		return 
+	}
+	fileOwnersMu.RLock()
+	peerListPtr , exits :=  fileOwners[fileName]
+	defer fileOwnersMu.RUnlock()
+	if !exits {
+		http.Error(w, "No peers available for the file", http.StatusNotFound)
+		return
+	}
 	
+	sort.Slice(peerListPtr,func (i ,j int) bool {
+		return peerListPtr[i].UploadingRate > peerListPtr[j].UploadingRate
+	})
+	if len(peerListPtr) > 50 {
+		peerListPtr = peerListPtr[:50]
+	}
+	peerList := make([]Peer, len(peerListPtr))
+	for i, peerPtr := range peerListPtr {
+		if peerPtr != nil {
+			peerList[i] = *peerPtr
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(peerList)
+	return
 }
 
 func main() {
@@ -164,7 +210,7 @@ func main() {
 
 	http.HandleFunc("/updateStatus",updatePeerStatus)
 
-	
+	http.HandleFunc("/getPeers",getPeers)
 	// Start the server with efficient logging
 	log.Println("Starting scalable server on :8080")
 	err := server.ListenAndServe()
