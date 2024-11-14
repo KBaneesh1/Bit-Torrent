@@ -80,11 +80,19 @@ func registerPeer(w http.ResponseWriter, r *http.Request) {
 	}
 
 	allPeers[peerIP] = data
-
 	updatesMu.Lock()
 	defer  updatesMu.Unlock()
 	peerLastUpdate[peerIP] = time.Now()
-	
+	fileOwnersMu.Lock()
+	defer fileOwnersMu.Unlock()
+	for _, file := range data.Files {
+		if _, exists := fileOwners[file]; !exists {
+			fileOwners[file] = make(map[int]*Peer, 0)
+		}
+		if _,exists := fileOwners[file][peerIP]; !exists {
+			fileOwners[file][peerIP] = allPeers[peerIP]
+		}
+	}
 	// Send a response back to the client
 	w.WriteHeader(http.StatusOK)
 	w.Header().Set("Content-Type", "application/json")
