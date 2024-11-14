@@ -17,7 +17,6 @@ import (
 
 type updatePeerStats struct {
 	Peer Peer  `json:"peer"`
-	Files []string `json:"files"`
 }
 type Peer struct {
 	IP              int     `json:"ip"`
@@ -25,11 +24,12 @@ type Peer struct {
 	UploadedBytes   int64   `json:"uploaded_bytes"`
 	DownloadingRate float64 `json:"downloading_rate"`
 	UploadingRate   float64 `json:"uploading_rate"`
-}
+	Files           []string `json:"files"`
+}		
 var (
 	allPeers      = make(map[int]*Peer)
 	peerLastUpdate = make(map[int]time.Time) // Stores last update timestamp for each peer
-	fileOwners    = make(map[string][]*Peer)
+	fileOwners    = make(map[string]map[int]*Peer)
 )
 var (
     peersMu       sync.RWMutex
@@ -46,7 +46,7 @@ func parseRegisterRequest(r *http.Request) (*Peer, error) {
 
 	// Unmarshal JSON data
 	if err := json.Unmarshal(body, &data); err != nil {
-		return nil, fmt.Errorf("Error parsing JSON")
+		return nil, err
 	}
 
 	return &data, nil
@@ -65,8 +65,11 @@ func registerPeer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	peerIP := data.IP
+
 	// Log the parsed data for verification(
 	fmt.Printf("Received registration:\nID: %d\n:", peerIP)
+	peersMu.Lock()
+	defer peersMu.Unlock()
 	if _,exists := allPeers[data.IP];exists {
 		w.WriteHeader(http.StatusOK)
 		w.Header().Set("Content-Type", "application/json")
@@ -75,8 +78,6 @@ func registerPeer(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(response)
 		return
 	}
-	peersMu.Lock()
-	defer  peersMu.Unlock()
 
 	allPeers[peerIP] = data
 
@@ -116,22 +117,30 @@ func updatePeerStatus(w http.ResponseWriter, r *http.Request) {
 	peerLastUpdate[data.Peer.IP] = time.Now()
 	updatesMu.Unlock()
 	// Update peer stats
+	fmt.Print(peer)
 	peersMu.Lock()
-	allPeers[peer.IP] = &data.Peer
+	allPeers[peer.IP].DownloadedBytes = data.Peer.DownloadedBytes 
+	allPeers[peer.IP].UploadedBytes = data.Peer.UploadedBytes 
+	allPeers[peer.IP].DownloadingRate = data.Peer.DownloadingRate 
+	allPeers[peer.IP].UploadingRate = data.Peer.UploadingRate 
+	allPeers[peer.IP].Files = data.Peer.Files
 	peersMu.Unlock()
+	
 	// Update file ownership
 	fileOwnersMu.Lock()
-	for _, file := range data.Files {
+	defer fileOwnersMu.Unlock()
+	for _, file := range data.Peer.Files {
 		if _, exists := fileOwners[file]; !exists {
-			fileOwners[file] = make([]*Peer, 0)
+			fileOwners[file] = make(map[int]*Peer, 0)
 		}
-		fileOwners[file] = append(fileOwners[file], peer)
+		if _,exists := fileOwners[file][data.Peer.IP]; !exists {
+			fileOwners[file][data.Peer.IP] = allPeers[data.Peer.IP]
+		}
 	}
-	fileOwnersMu.Unlock()
 	// Send response back to the client
 	w.WriteHeader(http.StatusOK)
 	w.Header().Set("Content-Type", "application/json")
-	response := map[string]string{"status": "Peer status updated successfully"}
+	response := map[string]string{"status": fmt.Sprintf("Peer %d status updated successfully",peer.IP)}
 	json.NewEncoder(w).Encode(response)
 }
 
@@ -140,16 +149,30 @@ func startPeerTimeoutChecker() {
 	defer ticker.Stop()
 
 	for range ticker.C {
-		peersMu.Lock()
+		
 		updatesMu.Lock()
 		for ip, lastUpdate := range peerLastUpdate {
 			if time.Since(lastUpdate) > 30*time.Minute {
 				fmt.Printf("Removing inactive peer with IP: %d\n", ip)
+				fileOwnersMu.Lock()
+				for _,file := range allPeers[ip].Files {
+					if _,exists := fileOwners[file][ip];exists{
+						delete(fileOwners[file],ip)
+					}
+					
+				}
+				fileOwnersMu.Unlock()
+	
+				peersMu.Lock()
+				fileOwnersMu.Lock()
+				//design issue of deleting peer from fileowner list
+				
 				delete(allPeers, ip)
+				// delete(fileOwners)
+				peersMu.Unlock()
 				delete(peerLastUpdate, ip)
 			}
 		}
-		peersMu.Unlock()
 		updatesMu.Unlock()
 	}
 }
@@ -168,12 +191,17 @@ func getPeers (w http.ResponseWriter, r *http.Request)  {
 		return 
 	}
 	fileOwnersMu.RLock()
-	peerListPtr , exits :=  fileOwners[fileName]
 	defer fileOwnersMu.RUnlock()
+	filePeers , exits :=  fileOwners[fileName]
 	if !exits {
 		http.Error(w, "No peers available for the file", http.StatusNotFound)
 		return
 	}
+	peerListPtr := make([]*Peer, 0, len(filePeers))
+	for _, peer := range filePeers {
+		peerListPtr = append(peerListPtr, peer)
+	}
+	
 	
 	sort.Slice(peerListPtr,func (i ,j int) bool {
 		return peerListPtr[i].UploadingRate > peerListPtr[j].UploadingRate
